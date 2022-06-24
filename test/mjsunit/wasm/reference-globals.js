@@ -1,0 +1,322 @@
+// Copyright 2020 the V8 project authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+// Flags: --experimental-wasm-gc
+
+d8.file.execute("test/mjsunit/wasm/wasm-module-builder.js");
+
+(function TestReferenceGlobals() {
+  print(arguments.callee.name);
+
+  var exporting_instance = (function() {
+    var builder = new WasmModuleBuilder();
+
+    var sig_index = builder.addType(kSig_i_ii);
+    var wrong_sig_index = builder.addType(kSig_i_i);
+
+    var addition_index = builder.addFunction("addition", sig_index)
+      .addBody([kExprLocalGet, 0, kExprLocalGet, 1, kExprI32Add])
+      .exportFunc();
+
+    builder.addGlobal(wasmRefType(sig_index), false,
+                      [kExprRefFunc, addition_index.index])
+           .exportAs("global");
+    builder.addGlobal(wasmOptRefType(wrong_sig_index), false)
+      .exportAs("mistyped_global");
+
+    return builder.instantiate({});
+  })();
+
+  // Mistyped imported global.
+  assertThrows(
+    () => {
+      var builder = new WasmModuleBuilder();
+      var sig_index = builder.addType(kSig_i_ii);
+      builder.addImportedGlobal("imports", "global", wasmOptRefType(sig_index),
+                                false);
+      builder.instantiate(
+        {imports: { global: exporting_instance.exports.mistyped_global }})},
+    WebAssembly.LinkError,
+    /imported global does not match the expected type/
+  );
+
+  // Mistyped imported global due to cross-module typechecking.
+  assertThrows(
+    () => {
+      var builder = new WasmModuleBuilder();
+      var sig_index = builder.addType(kSig_i_i);
+      builder.addImportedGlobal("imports", "global", wasmOptRefType(sig_index),
+                                false);
+      builder.instantiate(
+        {imports: { global: exporting_instance.exports.global }})},
+    WebAssembly.LinkError,
+    /imported global does not match the expected type/
+  );
+
+  // Non-function imported into function-typed global.
+  assertThrows(
+    () => {
+      var builder = new WasmModuleBuilder();
+      var sig_index = builder.addType(kSig_i_ii);
+      builder.addImportedGlobal("imports", "global", wasmOptRefType(sig_index),
+                                false);
+      builder.instantiate({imports: { global: 42 }})},
+    WebAssembly.LinkError,
+    /function-typed object must be null \(if nullable\) or a Wasm function object/
+  );
+
+  // Mistyped function import.
+  assertThrows(
+    () => {
+      var builder = new WasmModuleBuilder();
+      var sig_index = builder.addType(kSig_i_i);
+      builder.addImportedGlobal("imports", "global", wasmRefType(sig_index),
+                                false);
+      builder.instantiate(
+        {imports: { global: exporting_instance.exports.addition }})},
+    WebAssembly.LinkError,
+    /assigned exported function has to be a subtype of the expected type/
+  );
+
+  var instance = (function () {
+    var builder = new WasmModuleBuilder();
+
+    var sig_index = builder.addType(kSig_i_ii);
+
+    builder.addImportedGlobal("imports", "global", wasmOptRefType(sig_index),
+                              false);
+
+    builder.addFunction("test_import", kSig_i_ii)
+      .addBody([kExprLocalGet, 0, kExprLocalGet, 1, kExprGlobalGet, 0,
+                kExprCallRef])
+      .exportFunc();
+
+    return builder.instantiate({imports: {
+      global: exporting_instance.exports.global
+    }});
+  })();
+
+  // This module is valid.
+  assertFalse(instance === undefined);
+  assertFalse(instance === null);
+  assertFalse(instance === 0);
+
+  // The correct function reference has been passed.
+  assertEquals(66, instance.exports.test_import(42, 24));
+})();
+
+(function TestStructInitExpr() {
+  print(arguments.callee.name);
+
+  var builder = new WasmModuleBuilder();
+  var struct_index = builder.addStruct([{type: kWasmI32, mutability: false}]);
+  var composite_struct_index = builder.addStruct(
+      [{type: kWasmI32, mutability: false},
+       {type: wasmOptRefType(struct_index), mutability: false},
+       {type: kWasmI8, mutability: true}]);
+
+  let field1_value = 432;
+  let field2_value = -123;
+  let field3_value = -555;
+
+  var global0 = builder.addGlobal(
+      wasmRefType(struct_index), false,
+      [...wasmI32Const(field2_value),
+       kGCPrefix, kExprRttCanon, struct_index,
+       kGCPrefix, kExprStructNewWithRtt, struct_index]);
+
+  var global = builder.addGlobal(
+      wasmRefType(composite_struct_index), false,
+      [...wasmI32Const(field1_value), kExprGlobalGet, global0.index,
+       ...wasmI32Const(field3_value),
+       kGCPrefix, kExprRttCanon, composite_struct_index,
+       kGCPrefix, kExprStructNewWithRtt, composite_struct_index]);
+
+  var global_default = builder.addGlobal(
+    wasmRefType(composite_struct_index), false,
+    [kGCPrefix, kExprRttCanon, composite_struct_index,
+     kGCPrefix, kExprStructNewDefaultWithRtt, composite_struct_index]);
+
+  builder.addFunction("field_1", kSig_i_v)
+    .addBody([
+      kExprGlobalGet, global.index,
+      kGCPrefix, kExprStructGet, composite_struct_index, 0
+    ])
+    .exportFunc();
+
+  builder.addFunction("field_2", kSig_i_v)
+    .addBody([
+      kExprGlobalGet, global.index,
+      kGCPrefix, kExprStructGet, composite_struct_index, 1,
+      kGCPrefix, kExprStructGet, struct_index, 0
+    ])
+    .exportFunc();
+
+  builder.addFunction("field_3", kSig_i_v)
+    .addBody([
+      kExprGlobalGet, global.index,
+      kGCPrefix, kExprStructGetS, composite_struct_index, 2])
+    .exportFunc();
+
+  builder.addFunction("field_1_default", kSig_i_v)
+    .addBody([
+      kExprGlobalGet, global_default.index,
+      kGCPrefix, kExprStructGet, composite_struct_index, 0])
+    .exportFunc();
+
+  builder.addFunction("field_2_default", makeSig([], [kWasmAnyRef]))
+    .addBody([
+      kExprGlobalGet, global_default.index,
+      kGCPrefix, kExprStructGet, composite_struct_index, 1])
+    .exportFunc();
+
+  builder.addFunction("field_3_default", kSig_i_v)
+    .addBody([
+      kExprGlobalGet, global_default.index,
+      kGCPrefix, kExprStructGetS, composite_struct_index, 2])
+    .exportFunc();
+
+  var instance = builder.instantiate({});
+
+  assertEquals(field1_value, instance.exports.field_1());
+  assertEquals(field2_value, instance.exports.field_2());
+  assertEquals((field3_value << 24) >> 24, instance.exports.field_3());
+  assertEquals(0, instance.exports.field_1_default());
+  assertEquals(null, instance.exports.field_2_default());
+  assertEquals(0, instance.exports.field_3_default());
+})();
+
+(function TestArrayInitExprNumeric() {
+  print(arguments.callee.name);
+
+  var builder = new WasmModuleBuilder();
+  var array_index = builder.addArray(kWasmI16, true);
+
+  let element0_value = -44;
+  let element1_value = 55;
+
+  var global0 = builder.addGlobal(
+      kWasmI32, false,
+      wasmI32Const(element0_value));
+
+  var global = builder.addGlobal(
+      wasmRefType(array_index), false,
+      [kExprGlobalGet, global0.index, ...wasmI32Const(element1_value),
+       kGCPrefix, kExprRttCanon, array_index,
+       kGCPrefix, kExprArrayInit, array_index, 2]);
+
+  builder.addFunction("get_element", kSig_i_i)
+    .addBody([
+      kExprGlobalGet, global.index,
+      kExprLocalGet, 0,
+      kGCPrefix, kExprArrayGetS, array_index])
+    .exportFunc();
+
+  var instance = builder.instantiate({});
+
+  assertEquals(element0_value, instance.exports.get_element(0));
+  assertEquals(element1_value, instance.exports.get_element(1));
+})();
+
+(function TestArrayInitExprRef() {
+  print(arguments.callee.name);
+
+  var builder = new WasmModuleBuilder();
+  var struct_index = builder.addStruct([{type: kWasmI32, mutability: false}]);
+  var array_index = builder.addArray(wasmOptRefType(struct_index), true);
+
+  let element0_value = 44;
+  let element2_value = 55;
+
+  var global0 = builder.addGlobal(
+      wasmRefType(struct_index), false,
+      [...wasmI32Const(element0_value), kGCPrefix, kExprRttCanon, struct_index,
+       kGCPrefix, kExprStructNewWithRtt, struct_index]);
+
+  var global = builder.addGlobal(
+      wasmRefType(array_index), false,
+      [kExprGlobalGet, global0.index, kExprRefNull, struct_index,
+       ...wasmI32Const(element2_value),
+       kGCPrefix, kExprRttCanon, struct_index,
+       kGCPrefix, kExprStructNewWithRtt, struct_index,
+       kGCPrefix, kExprRttCanon, array_index,
+       kGCPrefix, kExprArrayInit, array_index, 3]);
+
+  builder.addFunction("element0", kSig_i_v)
+    .addBody([
+      kExprGlobalGet, global.index,
+      kExprI32Const, 0,
+      kGCPrefix, kExprArrayGet, array_index,
+      kGCPrefix, kExprStructGet, struct_index, 0])
+    .exportFunc();
+
+  builder.addFunction("element1", makeSig([], [kWasmAnyRef]))
+    .addBody([
+      kExprGlobalGet, global.index,
+      kExprI32Const, 1,
+      kGCPrefix, kExprArrayGet, array_index])
+    .exportFunc();
+
+  builder.addFunction("element2", kSig_i_v)
+    .addBody([
+      kExprGlobalGet, global.index,
+      kExprI32Const, 2,
+      kGCPrefix, kExprArrayGet, array_index,
+      kGCPrefix, kExprStructGet, struct_index, 0])
+    .exportFunc();
+
+  var instance = builder.instantiate({});
+
+  assertEquals(element0_value, instance.exports.element0());
+  assertEquals(null, instance.exports.element1());
+  assertEquals(element2_value, instance.exports.element2());
+})();
+
+(function TestI31RefConstantExpr() {
+  print(arguments.callee.name);
+  let builder = new WasmModuleBuilder();
+
+  let array_index = builder.addArray(kWasmI31Ref, false);
+
+  let values = [0, 10, -22, 0x7fffffff, -1];
+
+  let global = builder.addGlobal(
+      wasmRefType(array_index), true,
+      [...values.flatMap(
+        value => [...wasmI32Const(value), kGCPrefix, kExprI31New]),
+       kGCPrefix, kExprArrayInitStatic, array_index, 5]);
+
+  for (signed of [true, false]) {
+    builder.addFunction(`get_${signed ? "s" : "u"}`, kSig_i_i)
+        .addBody([kExprGlobalGet, global.index,
+                  kExprLocalGet, 0, kGCPrefix, kExprArrayGet, array_index,
+                  kGCPrefix, signed ? kExprI31GetS : kExprI31GetU])
+        .exportFunc();
+  }
+
+  let instance = builder.instantiate();
+
+  assertEquals(values[0], instance.exports.get_s(0));
+  assertEquals(values[1], instance.exports.get_s(1));
+  assertEquals(values[2], instance.exports.get_s(2));
+  assertEquals(values[3] | 0x80000000, instance.exports.get_s(3));
+  assertEquals(values[4], instance.exports.get_s(4));
+
+  assertEquals(values[0], instance.exports.get_u(0));
+  assertEquals(values[1], instance.exports.get_u(1));
+  assertEquals(values[2] & 0x7fffffff, instance.exports.get_u(2));
+  assertEquals(values[3], instance.exports.get_u(3));
+  assertEquals(values[4] & 0x7fffffff, instance.exports.get_u(4));
+})();
+
+(function TestI31RefConstantExprTypeError() {
+  print(arguments.callee.name);
+  let builder = new WasmModuleBuilder();
+
+  builder.addGlobal(kWasmI31Ref, false,
+                    [...wasmI64Const(0), kGCPrefix, kExprI31New]);
+
+  assertThrows(() => builder.instantiate(), WebAssembly.CompileError,
+               /i31.new\[0\] expected type i32, found i64.const of type i64/);
+})();
